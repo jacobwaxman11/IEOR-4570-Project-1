@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from tools import TOOLS, run_tool
+from tools import SUB_CALLS_KEY, TOOLS, run_tool
 
 # --- Config ---
 
@@ -22,6 +22,7 @@ Which tool to use:
 - Market caps, the CMC100 index, or BTC dominance: get_market_indices.
 - Sentiment, fear and greed, or altcoin season: get_market_sentiment.
 - News, headlines, or what's trending: get_crypto_news.
+- Open-ended or opinion questions (which coin to hold, best long-term pick, outlook): research_crypto.
 - An Ethereum transaction hash (0x followed by 64 hex characters): get_ethereum_data.
 
 How to answer:
@@ -32,10 +33,33 @@ How to answer:
 - Only cite numbers that appear in tool results. Format prices as dollars and changes as percentages.
 - If a tool returns an error, say what failed in plain language and answer with whatever data you did get.
 - Keep answers concise. Use a short list when presenting several coins.
-- Do not give financial advice or tell the user to buy or sell."""
-MAX_TOOL_ROUNDS = 6
+
+Research questions:
+- For open-ended or opinion questions, call research_crypto first. If something is missing, follow up with
+  other tools (e.g. get_price_history or compare_coins for a coin it didn't cover).
+- Then give a clear answer: name one pick, explain why using specific numbers from the results
+  (returns, performance vs BTC, trend, drawdown, dilution, sentiment, headlines), name the main risks,
+  and briefly say why you passed on the runners-up.
+- Treat BTC as the benchmark: a pick other than BTC should beat it on the evidence. Discuss at least one
+  mid-cap or small-cap coin from the shortlist and say why it did or didn't win. For multi-year horizons,
+  weigh dilution, drawdown history, and liquidity more heavily than short-term momentum.
+- Do not refuse just because the question is about investing. End with one sentence noting this is an
+  analysis of current data, not financial advice."""
+MAX_TOOL_ROUNDS = 8
 
 # --- The Harness ---
+
+
+def split_sub_calls(result: str) -> tuple[str, list[dict]]:
+    """Composite tools report the tools they ran; the UI shows them, the model doesn't need them."""
+    try:
+        data = json.loads(result)
+    except ValueError:
+        return result, []
+    if not isinstance(data, dict) or SUB_CALLS_KEY not in data:
+        return result, []
+    sub_calls = data.pop(SUB_CALLS_KEY)
+    return json.dumps(data), sub_calls
 
 
 def run_agent(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -64,8 +88,8 @@ def run_agent(messages: list[dict]) -> tuple[str, list[dict]]:
         # The harness, not the model, runs each tool and appends the result
         for call in reply.tool_calls:
             args = json.loads(call.function.arguments)
-            result = run_tool(call.function.name, args)
-            tool_calls += [{"name": call.function.name, "args": args, "result": result}]
+            result, sub_calls = split_sub_calls(run_tool(call.function.name, args))
+            tool_calls += [{"name": call.function.name, "args": args, "result": result, "sub_calls": sub_calls}]
 
             messages += [{"role": "tool", "tool_call_id": call.id, "content": result}]
 
