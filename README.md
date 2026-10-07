@@ -1,5 +1,11 @@
 # Crypto Chatbot Agent
 
+Jacob Waxman
+
+IEOR-4570
+
+Project 1
+
 A chat assistant that answers crypto questions with live market data. A Gemini model (via LiteLLM) decides which tools to call, a FastAPI harness runs them, and the web UI shows the answer along with every tool call it made.
 
 ## Quick start
