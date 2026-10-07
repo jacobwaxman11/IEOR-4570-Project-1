@@ -1,9 +1,11 @@
 """The tools the harness can run, and the JSON that describes them to the model."""
 
+import functools
 import json
 import os
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
@@ -153,14 +155,16 @@ def _global_metrics() -> dict:
 
 
 def _tool(fn):
-    """Turn ToolErrors into the {"error": ...} JSON the model can reason about."""
+    """Turn ToolErrors into the {"error": ...} JSON the model can reason about.
+
+    The raw dict-returning function stays reachable as `tool.__wrapped__` for composite tools.
+    """
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
             return json.dumps(fn(*args, **kwargs))
         except ToolError as e:
             return json.dumps({"error": str(e)})
-    wrapper.__name__ = fn.__name__
-    wrapper.__doc__ = fn.__doc__
     return wrapper
 
 
@@ -192,14 +196,19 @@ def _resolve_cg_id(symbol: str) -> tuple[str, str]:
     return best["id"], best["name"]
 
 
+def _price_series(symbol: str, days: int) -> tuple[str, list[list[float]]]:
+    """Daily [timestamp_ms, price] pairs from CoinGecko, plus the coin's display name."""
+    coin_id, name = _resolve_cg_id(symbol.strip())
+    chart = _cg_get(f"/coins/{coin_id}/market_chart",
+                    {"vs_currency": "usd", "days": days, "interval": "daily"})
+    return name, chart.get("prices") or []
+
+
 @_tool
 def get_price_history(ticker_symbol: str, days: int = 7) -> dict:
     """Daily price history with summary stats over the last N days."""
     days = max(1, min(int(days), 365))
-    coin_id, name = _resolve_cg_id(ticker_symbol.strip())
-    chart = _cg_get(f"/coins/{coin_id}/market_chart",
-                    {"vs_currency": "usd", "days": days, "interval": "daily"})
-    prices = chart.get("prices") or []
+    name, prices = _price_series(ticker_symbol, days)
     if len(prices) < 2:
         raise ToolError(f"Not enough price history for {ticker_symbol}")
 
@@ -395,6 +404,263 @@ def get_crypto_news(coins: list[str] | None = None, query: str = "", limit: int 
     return result
 
 
+# --- Research: stage 1 screens the top N coins, stage 2 deep-dives a shortlist ---
+
+# Shortlist slots per market-cap tier, so smaller coins always get considered.
+SHORTLIST_TIERS = (("large cap", 2, 10, 2), ("mid cap", 11, 50, 3), ("small cap", 51, 250, 2))
+# Exact CMC tags only: substrings like "real-world" also match infrastructure projects (LINK, AVAX).
+EXCLUDED_TAGS = {"stablecoin", "tokenized-gold", "tokenized-assets", "tokenized-commodities",
+                 "tokenized-stock", "wrapped-tokens", "fan-token"}
+MIN_VOLUME_TO_MCAP = 0.005
+
+
+def _pct(start, end):
+    return _round((end - start) / start * 100) if start else None
+
+
+def _max_drawdown_pct(values: list[float]) -> float:
+    peak, worst = values[0], 0.0
+    for v in values:
+        peak = max(peak, v)
+        worst = min(worst, (v - peak) / peak)
+    return _round(worst * 100)
+
+
+def _percentiles(values: list) -> list[float]:
+    """0-1 rank of each value within the list; missing values score 0.5."""
+    present = sorted(v for v in values if v is not None)
+    if len(present) < 2:
+        return [0.5] * len(values)
+    return [0.5 if v is None else present.index(v) / (len(present) - 1) for v in values]
+
+
+def _tier(rank) -> str:
+    if rank and rank <= 10:
+        return "large cap"
+    return "mid cap" if rank and rank <= 50 else "small cap"
+
+
+def _screen_universe(size: int) -> dict:
+    """Score every investable coin in the top N on momentum vs BTC, dilution, and liquidity."""
+    coins = _cg_get("/coins/markets", {
+        "vs_currency": "usd", "per_page": size, "page": 1,
+        "price_change_percentage": "7d,30d,200d,1y",
+    })
+    tags = {c["symbol"].upper(): c.get("tags") or [] for c in _cmc_get(
+        "/v3/cryptocurrency/listings/latest", {"limit": min(size + 20, 200)})}
+    btc = next((c for c in coins if c["id"] == "bitcoin"), None)
+    if not btc:
+        raise ToolError("Bitcoin missing from CoinGecko markets; cannot benchmark")
+
+    def change(c, period):
+        return c.get(f"price_change_percentage_{period}_in_currency")
+
+    universe, excluded = [], {}
+    for c in coins:
+        sym, mcap = c["symbol"].upper(), c.get("market_cap") or 0
+        if EXCLUDED_TAGS & set(tags.get(sym, [])):
+            excluded[sym] = "stablecoin / tokenized / wrapped asset"
+        elif abs(change(c, "200d") or 0) < 2 and abs(change(c, "1y") or 0) < 2:
+            excluded[sym] = "pegged price"
+        elif not mcap or (c.get("total_volume") or 0) / mcap < MIN_VOLUME_TO_MCAP:
+            excluded[sym] = "illiquid"
+        else:
+            universe.append(c)
+
+    factors = {
+        "rs_30d": [None if change(c, "30d") is None else change(c, "30d") - change(btc, "30d") for c in universe],
+        "rs_200d": [None if change(c, "200d") is None else change(c, "200d") - change(btc, "200d") for c in universe],
+        "rs_1y": [None if change(c, "1y") is None else change(c, "1y") - change(btc, "1y") for c in universe],
+        "circulating_share": [c["market_cap"] / c["fully_diluted_valuation"] if c.get("fully_diluted_valuation") else None
+                              for c in universe],
+        "liquidity": [c["total_volume"] / c["market_cap"] for c in universe],
+    }
+    ranked = list(zip(*(_percentiles(v) for v in factors.values())))
+    for c, pcts, *raw in zip(universe, ranked, *factors.values()):
+        c["_score"] = round(sum(pcts) / len(pcts) * 100)
+        c["_factors"] = dict(zip(factors, raw))
+    universe.sort(key=lambda c: c["_score"], reverse=True)
+    return {"universe": universe, "excluded": excluded, "btc": btc}
+
+
+def _shortlist(universe: list[dict], btc: dict, forced: list[str]) -> list[dict]:
+    picks = [btc]
+    for symbol in forced:
+        match = next((c for c in universe if c["symbol"].upper() == symbol), None)
+        if match and match not in picks:
+            picks.append(match)
+    for _, low, high, slots in SHORTLIST_TIERS:
+        tier = [c for c in universe if low <= (c.get("market_cap_rank") or 999) <= high and c not in picks]
+        picks += tier[:slots]
+    return picks
+
+
+def _labels(card: dict, coin: dict) -> None:
+    """Plain-language reads of the numbers, so the model doesn't have to do the math."""
+    f = coin.get("_factors", {})
+    share = f.get("circulating_share")
+    liquidity = f.get("liquidity") or 0
+    card["dilution"] = ("unknown" if share is None else "low" if share >= 0.9
+                        else "moderate" if share >= 0.6 else f"high ({round((1 - share) * 100)}% of supply not circulating)")
+    card["liquidity"] = "high" if liquidity >= 0.05 else "medium" if liquidity >= 0.01 else "low"
+    flags = []
+    if (f.get("rs_200d") or 0) > 0:
+        flags.append("outperforming BTC over 200d")
+    if (f.get("rs_1y") or 0) > 0:
+        flags.append("outperforming BTC over 1y")
+    if (card.get("max_drawdown_pct") or 0) < -70:
+        flags.append("deep drawdown history")
+    if (card.get("from_ath_pct") or 0) < -80:
+        flags.append("more than 80% below all-time high")
+    if share is not None and share < 0.6:
+        flags.append("significant future token unlocks")
+    card["flags"] = flags
+
+
+def _deep_dive(coin: dict, btc_returns: list[float] | None) -> dict:
+    """One-year chart stats for a shortlisted coin, labelled for easy reading."""
+    chart = _cg_get(f"/coins/{coin['id']}/market_chart", {"vs_currency": "usd", "days": 365, "interval": "daily"})
+    values = [p for _, p in chart.get("prices") or []]
+    if len(values) < 200:
+        raise ToolError(f"Not enough price history for {coin['symbol'].upper()}")
+    returns = [(b - a) / a for a, b in zip(values, values[1:]) if a]
+    annual_vol = statistics.stdev(returns) * (365 ** 0.5) * 100
+    one_year = _pct(values[0], values[-1])
+    ma50, ma200 = statistics.fmean(values[-50:]), statistics.fmean(values[-200:])
+    price = values[-1]
+    trend = ("uptrend (above 50d and 200d average)" if price > ma50 and price > ma200
+             else "downtrend (below 50d and 200d average)" if price < ma50 and price < ma200 else "mixed")
+
+    correlation = None
+    if btc_returns and coin["id"] != "bitcoin":
+        n = min(len(returns), len(btc_returns))
+        correlation = _round(statistics.correlation(returns[-n:], btc_returns[-n:]))
+
+    rank = coin.get("market_cap_rank")
+    card = {
+        "symbol": coin["symbol"].upper(),
+        "name": coin["name"],
+        "tier": f"{_tier(rank)} (rank {rank})",
+        "screen_score": coin.get("_score"),
+        "price_usd": _round(price),
+        "returns_pct": {f"{d}d": _pct(values[-d - 1], price) for d in (7, 30, 90, 180)} | {"365d": one_year},
+        "vs_btc_pts": {k: _round(coin["_factors"][f"rs_{k}"]) for k in ("30d", "200d", "1y")}
+                      if coin.get("_factors") else None,
+        "trend": trend,
+        "annualized_volatility_pct": _round(annual_vol),
+        "return_to_risk": _round(one_year / annual_vol) if annual_vol and one_year is not None else None,
+        "max_drawdown_pct": _max_drawdown_pct(values),
+        "from_365d_high_pct": _pct(max(values), price),
+        "from_ath_pct": _round(coin.get("ath_change_percentage")),
+        "correlation_to_btc": correlation,
+    }
+    _labels(card, coin)
+    return card
+
+
+def _research_news(coins: list[str], limit: int) -> dict:
+    """Newsdata rejects the whole request if any coin filter is unknown, so fall back to unfiltered news."""
+    try:
+        return get_crypto_news.__wrapped__(coins, "", limit)
+    except ToolError:
+        return get_crypto_news.__wrapped__(None, "", limit)
+
+
+# Composite tools list the tools they ran under this key. The harness strips it before the
+# result reaches the model and forwards it to the UI instead.
+SUB_CALLS_KEY = "_sub_calls"
+
+
+def _sub_call(name: str, fn, **args) -> tuple[dict, dict]:
+    """Run a tool's raw function and return (UI record, result). Failures become {"error": ...}."""
+    try:
+        result = fn(**args)
+    except ToolError as e:
+        result = {"error": str(e)}
+    return {"name": name, "args": args, "result": json.dumps(result)}, result
+
+
+@_tool
+def research_crypto(candidates: list[str] | None = None, universe_size: int = 100) -> dict:
+    """Screen the top N coins, deep-dive a tiered shortlist, and add market context and news."""
+    universe_size = max(50, min(int(universe_size), 250))
+    forced = _clean_symbols(candidates)[:3]
+
+    screen_record, screen = _sub_call("screen_market", _screen_universe, size=universe_size)
+    if "error" in screen:
+        raise ToolError(screen["error"])
+    universe, btc = screen["universe"], screen["btc"]
+    shortlist = _shortlist(universe, btc, forced)
+    screen_record["result"] = json.dumps({
+        "screened": universe_size,
+        "excluded": screen["excluded"],
+        "top_scores": [{"symbol": c["symbol"].upper(), "rank": c.get("market_cap_rank"), "score": c["_score"]}
+                       for c in universe[:15]],
+        "shortlist": [c["symbol"].upper() for c in shortlist],
+    })
+
+    symbols = [c["symbol"].upper() for c in shortlist]
+    news_batches = [symbols[i:i + 4] for i in range(0, len(symbols), 4)][:2]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        # BTC first: its daily returns are the correlation benchmark for everyone else.
+        btc_record, btc_card = _sub_call("analyze_price_history", _deep_dive, coin=btc, btc_returns=None)
+        btc_values = [p for _, p in _cg_get("/coins/bitcoin/market_chart",
+                                            {"vs_currency": "usd", "days": 365, "interval": "daily"})["prices"]]
+        btc_returns = [(b - a) / a for a, b in zip(btc_values, btc_values[1:]) if a]
+        card_futures = [pool.submit(_sub_call, "analyze_price_history", _deep_dive, coin=c, btc_returns=btc_returns)
+                        for c in shortlist[1:]]
+        sentiment_f = pool.submit(_sub_call, "get_market_sentiment", get_market_sentiment.__wrapped__, history_days=30)
+        indices_f = pool.submit(_sub_call, "get_market_indices", get_market_indices.__wrapped__, history_days=0)
+        news_fs = [pool.submit(_sub_call, "get_crypto_news", _research_news, coins=batch, limit=10)
+                   for batch in news_batches]
+        card_results = [(btc_record, btc_card)] + [f.result() for f in card_futures]
+        (sentiment_record, sentiment), (indices_record, indices) = sentiment_f.result(), indices_f.result()
+        news_results = [f.result() for f in news_fs]
+
+    for name, data in (("sentiment", sentiment), ("indices", indices)):
+        if "error" in data:
+            raise ToolError(f"Research {name} step failed: {data['error']}")
+
+    for (record, card), coin in zip(card_results, shortlist):
+        record["args"] = {"symbol": coin["symbol"].upper(), "days": 365}
+    articles = [a for _, news in news_results for a in news.get("articles", [])]
+    cards = []
+    for _, card in card_results:
+        if "error" not in card:
+            name = card["name"].lower()
+            card["headlines"] = [a["title"] for a in articles if a.get("title") and
+                                 (card["symbol"] in a["title"] or name in a["title"].lower())][:3]
+        cards.append(card)
+
+    fng, alt = sentiment["fear_and_greed"], sentiment["altcoin_season"]
+    sub_calls = [screen_record, *(r for r, _ in card_results), sentiment_record, indices_record,
+                 *(r for r, _ in news_results)]
+    return {
+        "method": (
+            f"Screened the top {universe_size} coins by market cap. Excluded {len(screen['excluded'])} "
+            "stablecoins, tokenized/wrapped assets, pegged or illiquid coins. Scored the rest 0-100 on "
+            "performance vs BTC (30d, 200d, 1y), share of supply circulating, and liquidity, then shortlisted "
+            "BTC as the benchmark plus the best scorers in each tier (large, mid, small cap). Price stats "
+            "cover 365 days, the free-plan maximum, so multi-year views extrapolate from that window."
+        ),
+        "market_context": {
+            "global": indices["global"],
+            "cmc100_change_24h_pct": indices["cmc100"]["change_24h_pct"],
+            "fear_and_greed": {"value": fng["value"], "classification": fng["classification"],
+                               "value_30d_ago": (fng.get("history") or [{}])[0].get("value")},
+            "altcoin_season": {k: alt.get(k) for k in ("value", "yearly_high", "yearly_low")},
+        },
+        "screen_top_10": [
+            {"symbol": c["symbol"].upper(), "tier": _tier(c.get("market_cap_rank")), "score": c["_score"]}
+            for c in universe[:10]
+        ],
+        "shortlist": cards,
+        "trending": next((n.get("trending") for _, n in news_results if n.get("trending")), None),
+        "latest_headlines": [{"title": a["title"], "source": a["source"]} for a in articles[:5]],
+        SUB_CALLS_KEY: sub_calls,
+    }
+
+
 @_tool
 def get_ethereum_data(tx_hash: str) -> dict:
     """Look up an Ethereum transaction by its hash."""
@@ -578,6 +844,33 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "research_crypto",
+            "description": (
+                "Deep research for open-ended or long-term questions (e.g. 'which coin would you hold for 3 years', "
+                "'what's the strongest asset right now'). Screens the top N coins on performance vs BTC, dilution, "
+                "and liquidity, then deep-dives a shortlist spanning large, mid, and small caps (with BTC as the "
+                "benchmark): multi-period returns, trend, volatility, drawdown, correlation to BTC, plain-language "
+                "flags, and related headlines. Also returns market sentiment, dominance, and trending coins."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidates": {
+                        **SYMBOL_LIST,
+                        "description": "Optional: up to 3 tickers to force onto the shortlist, e.g. ['LINK'].",
+                    },
+                    "universe_size": {
+                        "type": "integer",
+                        "description": "How many top coins by market cap to screen, 50 to 250. Defaults to 100.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_ethereum_data",
             "description": (
                 "Look up an Ethereum mainnet transaction by its hash. Returns status, block, "
@@ -606,6 +899,7 @@ TOOL_MAP = {
     "get_market_indices": get_market_indices,
     "get_market_sentiment": get_market_sentiment,
     "get_crypto_news": get_crypto_news,
+    "research_crypto": research_crypto,
     "get_ethereum_data": get_ethereum_data,
 }
 
